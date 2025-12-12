@@ -1,102 +1,97 @@
 pipeline {
-    agent any
+  agent {
+    docker {
+      image 'python:3.10'
+      args '-u' // unbuffered output
+    }
+  }
 
-    environment {
-        // will be set in init stage
-        TS = ""
-        ART_DIR = "/tmp/advision-logs"
+  environment {
+    ART_DIR = "/tmp/advision-logs"
+  }
+
+  stages {
+    stage('init') {
+      steps {
+        script {
+          echo "Checking python availability..."
+          sh "python --version"
+          // compute timestamp defensively (try date -u first, fallback to date)
+          def tsOut = sh(script: "date -u +%Y%m%dT%H%M%SZ || true", returnStdout: true).trim()
+          if (!tsOut) {
+            tsOut = sh(script: "date +%Y%m%dT%H%M%SZ || true", returnStdout: true).trim()
+          }
+          if (!tsOut) {
+            // final fallback to java timestamp
+            tsOut = new Date().format("yyyyMMdd'T'HHmmss'Z'", TimeZone.getTimeZone('UTC'))
+          }
+          env.TS = tsOut
+          echo "Build timestamp: ${env.TS}"
+
+          sh "mkdir -p ${ART_DIR} || true"
+          sh "rm -rf reports || true; mkdir -p reports"
+        }
+      }
     }
 
-    stages {
-        stage('init') {
-            steps {
-                script {
-                    // Confirm python3 availability
-                    echo "Checking python3 availability..."
-                    def pyCheck = sh(script: "which python3 >/dev/null 2>&1 && python3 --version || true", returnStdout: true).trim()
-                    if (!pyCheck) {
-                        error("python3 not found on agent. Please install python3.")
-                    } else {
-                        echo "python3 present: ${pyCheck}"
-                    }
-
-                    // create timestamp (UTC ISO-like) and set into env.TS
-                    env.TS = sh(script: "date -u +%Y%m%dT%H%M%SZ", returnStdout: true).trim()
-                    echo "Build timestamp: ${env.TS}"
-
-                    // ensure artifact dir exists on agent
-                    sh "mkdir -p ${env.ART_DIR}"
-                }
-            }
+    stage('test') {
+      steps {
+        script {
+          // Use venv inside the container to ensure clean installs / no system pip confusion
+          sh """
+            python -m venv venv
+            . venv/bin/activate
+            pip install --upgrade pip
+            pip install pytest
+            # run pytest and produce junit xml (use env.TS)
+            venv/bin/pytest -q --junitxml=reports/junit-${env.TS}.xml || true
+            echo "pytest finished at ${env.TS}" > reports/run-${env.TS}.log || true
+          """
         }
-
-        stage('test') {
-            steps {
-                script {
-                    // Create a reports directory
-                    sh "rm -rf reports || true; mkdir -p reports"
-
-                    // Ensure dependencies installed (only pytest here)
-                    sh "python3 -m pip --version || true"
-                    sh "python3 -m pip install --user pytest || true"
-
-                    // Run tests and generate junit xml (timestamped)
-                    sh """
-                      python3 -m pytest -q --junitxml=reports/junit-${env.TS}.xml || true
-                    """
-
-                    // Save console output to a log file (optional)
-                    // sh "echo 'pytest finished at $(date -u)' > reports/run-${env.TS}.log || true"
-                    sh "echo 'pytest finished at ${env.TS}' > reports/run-${env.TS}.log || true"
-
-                }
-            }
-            post {
-                always {
-                    // Publish junit results to Jenkins
-                    junit allowEmptyResults: true, testResults: "reports/junit-${env.TS}.xml"
-                    archiveArtifacts artifacts: "reports/**", fingerprint: true
-                }
-            }
-        }
-
-        stage('verify') {
-            steps {
-                script {
-                    // Put any static verification here (lint, small static checks). Example: ensure tests produced a junit xml.
-                    if (!fileExists("reports/junit-${env.TS}.xml")) {
-                        echo "Warning: junit xml not found: reports/junit-${env.TS}.xml"
-                        // depending on policy, you can fail:
-                        // error("No junit test results produced.")
-                    } else {
-                        echo "JUnit results present."
-                    }
-                }
-            }
-        }
-
-        stage('publish') {
-            steps {
-                script {
-                    // create a timestamped tarball of reports and workspace artifacts
-                    def tarName = "advision-artifact-${env.TS}.tar.gz"
-                    sh """
-                      tar -czf ${tarName} reports || true
-                      mkdir -p ${ART_DIR}
-                      mv -f ${tarName} ${ART_DIR}/${tarName}
-                      echo "Artifacts copied to ${ART_DIR}/${tarName}"
-                    """
-
-                    // Also archive artifact into Jenkins UI (archives must be in workspace path)
-                    archiveArtifacts artifacts: "${ART_DIR}/${tarName}", allowEmptyArchive: false, fingerprint: true
-                }
-            }
-        }
-    } // stages
-
-    post {
+      }
+      post {
         always {
-            echo "Pipeline finished at: ${sh(script: 'date -u', returnStdout: true).trim()}"
+          junit allowEmptyResults: true, testResults: "reports/junit-${env.TS}.xml"
+          archiveArtifacts artifacts: "reports/**", fingerprint: true
         }
+      }
     }
+
+    stage('verify') {
+      steps {
+        script {
+          sh "ls -la reports || true"
+          if (!fileExists("reports/junit-${env.TS}.xml")) {
+            echo "Warning: junit xml not found: reports/junit-${env.TS}.xml"
+            // do not fail here — tests may legitimately produce no xml; handle later if needed
+          }
+        }
+      }
+    }
+
+    stage('publish') {
+      steps {
+        script {
+          def tarName = "advision-artifact-${env.TS}.tar.gz"
+          sh "tar -czf ${tarName} reports || true"
+
+          // copy artifact into container's ART_DIR (this directory should be mounted to your host)
+          sh "mkdir -p ${ART_DIR} || true"
+          sh "mv -f ${tarName} ${ART_DIR}/${tarName} || true"
+
+          // ensure a copy exists in the workspace so Jenkins' archiveArtifacts sees it
+          sh "cp ${ART_DIR}/${tarName} . || true"
+          archiveArtifacts artifacts: "${tarName}", fingerprint: true
+
+          echo "Artifacts copied to ${ART_DIR}/${tarName}"
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      sh "echo Pipeline finished at: \$(date -u) || true"
+    }
+  }
 }

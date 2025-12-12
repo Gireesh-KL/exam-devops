@@ -1,10 +1,5 @@
 pipeline {
-  agent {
-    docker {
-      image 'python:3.10'
-      args '-u' // unbuffered output
-    }
-  }
+  agent any
 
   environment {
     ART_DIR = "/tmp/advision-logs"
@@ -15,14 +10,13 @@ pipeline {
       steps {
         script {
           echo "Checking python availability..."
-          sh "python --version"
-          // compute timestamp defensively (try date -u first, fallback to date)
+          sh "python3 --version || python --version"
+          // compute timestamp defensively
           def tsOut = sh(script: "date -u +%Y%m%dT%H%M%SZ || true", returnStdout: true).trim()
           if (!tsOut) {
             tsOut = sh(script: "date +%Y%m%dT%H%M%SZ || true", returnStdout: true).trim()
           }
           if (!tsOut) {
-            // final fallback to java timestamp
             tsOut = new Date().format("yyyyMMdd'T'HHmmss'Z'", TimeZone.getTimeZone('UTC'))
           }
           env.TS = tsOut
@@ -37,21 +31,26 @@ pipeline {
     stage('test') {
       steps {
         script {
-          // Use venv inside the container to ensure clean installs / no system pip confusion
-          sh """
-            python -m venv venv
+          // create venv and install pytest inside it; avoids system pip issues (PEP 668)
+          sh '''
+            # prefer python3, fall back to python
+            PY_CMD=python3
+            if ! command -v $PY_CMD >/dev/null 2>&1; then
+              PY_CMD=python
+            fi
+            echo "Using $PY_CMD to create venv"
+            $PY_CMD -m venv venv
             . venv/bin/activate
             pip install --upgrade pip
             pip install pytest
-            # run pytest and produce junit xml (use env.TS)
-            venv/bin/pytest -q --junitxml=reports/junit-${env.TS}.xml || true
-            echo "pytest finished at ${env.TS}" > reports/run-${env.TS}.log || true
-          """
+            pytest -q --junitxml=reports/junit-${TS}.xml || true
+            echo "pytest finished at ${TS}" > reports/run-${TS}.log || true
+          '''
         }
       }
       post {
         always {
-          junit allowEmptyResults: true, testResults: "reports/junit-${env.TS}.xml"
+          junit allowEmptyResults: true, testResults: "reports/junit-${TS}.xml"
           archiveArtifacts artifacts: "reports/**", fingerprint: true
         }
       }
@@ -63,7 +62,6 @@ pipeline {
           sh "ls -la reports || true"
           if (!fileExists("reports/junit-${env.TS}.xml")) {
             echo "Warning: junit xml not found: reports/junit-${env.TS}.xml"
-            // do not fail here — tests may legitimately produce no xml; handle later if needed
           }
         }
       }
@@ -74,15 +72,10 @@ pipeline {
         script {
           def tarName = "advision-artifact-${env.TS}.tar.gz"
           sh "tar -czf ${tarName} reports || true"
-
-          // copy artifact into container's ART_DIR (this directory should be mounted to your host)
           sh "mkdir -p ${ART_DIR} || true"
           sh "mv -f ${tarName} ${ART_DIR}/${tarName} || true"
-
-          // ensure a copy exists in the workspace so Jenkins' archiveArtifacts sees it
           sh "cp ${ART_DIR}/${tarName} . || true"
           archiveArtifacts artifacts: "${tarName}", fingerprint: true
-
           echo "Artifacts copied to ${ART_DIR}/${tarName}"
         }
       }
@@ -91,7 +84,7 @@ pipeline {
 
   post {
     always {
-      sh "echo Pipeline finished at: \$(date -u) || true"
+      sh "echo Pipeline finished at: $(date -u) || true"
     }
   }
 }

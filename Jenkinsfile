@@ -46,7 +46,9 @@ pipeline {
                     """
 
                     // Save console output to a log file (optional)
-                    sh "echo 'pytest finished at $(date -u)' > reports/run-${env.TS}.log || true"
+                    // sh "echo 'pytest finished at $(date -u)' > reports/run-${env.TS}.log || true"
+                    sh "echo 'pytest finished at ${env.TS}' > reports/run-${env.TS}.log || true"
+
                 }
             }
             post {
